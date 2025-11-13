@@ -1,268 +1,187 @@
 import telebot
-import sqlite3
-from datetime import datetime
-import matplotlib.pyplot as plt
+import json
 import os
-from telebot import types
+from flask import Flask, request
+from threading import Thread
 
-TOKEN = "8554822217:AAHI2AJdlfbPbx8nZ_aewxMiaaiw7PcbIQU"  # твой токен
+# Загружаем токен из переменных окружения
+TOKEN = os.getenv("TOKEN")
 bot = telebot.TeleBot(TOKEN)
+app = Flask(__name__)
 
-DB_PATH = "db.sqlite"
-VIDEOS_DIR = "videos"
+DATA_FILE = "exercises.json"
 
-# --- Проверка папки для видео ---
-if not os.path.exists(VIDEOS_DIR):
-    os.makedirs(VIDEOS_DIR)
+# ---------- Работа с JSON ----------
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump({
+                "понедельник": [], "вторник": [], "среда": [],
+                "четверг": [], "пятница": [], "суббота": [], "воскресенье": []
+            }, f, ensure_ascii=False, indent=2)
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-# --- Создание базы данных ---
-conn = sqlite3.connect(DB_PATH)
-c = conn.cursor()
-c.execute('''
-CREATE TABLE IF NOT EXISTS exercises (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    day TEXT,
-    type TEXT,
-    video TEXT
-)
-''')
-c.execute('''
-CREATE TABLE IF NOT EXISTS progress (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    exercise_id INTEGER,
-    date TEXT,
-    sets INTEGER,
-    weight REAL,
-    duration INTEGER
-)
-''')
-conn.commit()
-conn.close()
 
-# --- Хранение состояния пользователя ---
-user_state = {}
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-# --- Главная клавиатура ---
-def main_keyboard():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.row("🏋️ Силовая тренировка", "🏃 Кардио")
-    markup.row("📅 Расписание", "➕ Добавить упражнение", "🗑 Удалить упражнение")
-    markup.row("📈 Прогресс")
-    return markup
 
-# --- Хэлпер функции ---
-def get_exercises_for_day(day):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, name, type, video FROM exercises WHERE day=?", (day,))
-    exercises = c.fetchall()
-    conn.close()
-    return exercises
+data = load_data()
 
-def save_progress(exercise_id, sets=None, weight=None, duration=None):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO progress (exercise_id, date, sets, weight, duration) VALUES (?,?,?,?,?)",
-              (exercise_id, datetime.now().strftime("%Y-%m-%d"), sets, weight, duration))
-    conn.commit()
-    conn.close()
+# ---------- Вспомогательные клавиатуры ----------
+def cancel_keyboard():
+    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("↩️ Назад", "❌ Отмена")
+    return kb
 
-# --- Команды ---
+
+def days_keyboard():
+    kb = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("понедельник", "вторник", "среда")
+    kb.row("четверг", "пятница", "суббота", "воскресенье")
+    kb.row("❌ Отмена")
+    return kb
+
+
+# ---------- Команды ----------
 @bot.message_handler(commands=['start'])
 def start(message):
-    bot.send_message(message.chat.id, "Привет, качок! 💪", reply_markup=main_keyboard())
+    bot.send_message(message.chat.id, "🏋️ Привет! Я твой фитнес-бот.\n\n"
+                                      "Выбери день недели, чтобы добавить упражнение.",
+                     reply_markup=days_keyboard())
 
-# --- Тренировка на выбранный день ---
-@bot.message_handler(func=lambda m: m.text in ["🏋️ Силовая тренировка","🏃 Кардио"])
-def training_choice(message):
-    day = datetime.now().strftime("%A").lower()
-    exercises = get_exercises_for_day(day)
-    if not exercises:
-        bot.send_message(message.chat.id, f"Сегодня нет запланированных упражнений 😔", reply_markup=main_keyboard())
-        return
-    # фильтруем по типу
-    ex_type = "strength" if message.text == "🏋️ Силовая тренировка" else "cardio"
-    exercises = [e for e in exercises if e[2]==ex_type]
-    if not exercises:
-        bot.send_message(message.chat.id, f"Сегодня нет упражнений этого типа 😔", reply_markup=main_keyboard())
-        return
-    user_state[message.chat.id] = {"exercises": exercises, "index": 0}
-    send_next_exercise(message.chat.id)
 
-def send_next_exercise(chat_id):
-    state = user_state.get(chat_id)
-    if not state:
-        return
-    if state["index"] >= len(state["exercises"]):
-        bot.send_message(chat_id, "Тренировка завершена! 🎉", reply_markup=main_keyboard())
-        send_progress_graph(chat_id)
-        user_state.pop(chat_id)
-        return
-    ex = state["exercises"][state["index"]]
-    ex_id, name, ex_type, video = ex
-    bot.send_message(chat_id, f"Упражнение: {name} ({'Силовое' if ex_type=='strength' else 'Кардио'})")
-    if video and os.path.exists(video):
-        bot.send_video(chat_id, open(video, 'rb'))
-    if ex_type == "strength":
-        msg = bot.send_message(chat_id, "Сколько подходов сделал?")
-        bot.register_next_step_handler(msg, lambda m: ask_weight(m, ex_id))
+@bot.message_handler(func=lambda m: m.text and m.text.lower() in data.keys())
+def choose_day(message):
+    day = message.text.lower()
+    bot.send_message(message.chat.id, f"📆 Добавляем упражнение на {day}. Введи название упражнения:",
+                     reply_markup=cancel_keyboard())
+    bot.register_next_step_handler(message, lambda msg: get_exercise_name(msg, day))
+
+
+def get_exercise_name(message, day):
+    if message.text.lower() == "❌ отмена":
+        return start(message)
+    elif message.text.lower() == "↩️ назад":
+        return start(message)
+
+    name = message.text
+    bot.send_message(message.chat.id, "💪 Это силовая тренировка? (да/нет)",
+                     reply_markup=cancel_keyboard())
+    bot.register_next_step_handler(message, lambda msg: get_exercise_type(msg, day, name))
+
+
+def get_exercise_type(message, day, name):
+    if message.text.lower() in ["❌ отмена", "↩️ назад"]:
+        return choose_day(message)
+
+    is_power = message.text.lower() in ["да", "д", "yes", "y"]
+    bot.send_message(message.chat.id, "📹 Пришли видео упражнения (или напиши 'нет', чтобы пропустить):",
+                     reply_markup=cancel_keyboard())
+    bot.register_next_step_handler(message, lambda msg: get_video(msg, day, name, is_power))
+
+
+def get_video(message, day, name, is_power):
+    if message.text.lower() == "❌ отмена":
+        return start(message)
+    elif message.text.lower() == "↩️ назад":
+        return get_exercise_name(message, day)
+
+    video_id = None
+    if message.content_type == "video":
+        video_id = message.video.file_id
+    elif message.text.lower() == "нет":
+        video_id = None
+
+    new_ex = {
+        "название": name,
+        "тип": "силовое" if is_power else "кардио",
+        "video_id": video_id,
+        "подходы": [],
+        "вес": []
+    }
+
+    data[day].append(new_ex)
+    save_data(data)
+
+    if is_power:
+        bot.send_message(message.chat.id, f"💪 Сколько подходов сделал в '{name}'?",
+                         reply_markup=cancel_keyboard())
+        bot.register_next_step_handler(message, lambda msg: get_sets(msg, day, name))
     else:
-        msg = bot.send_message(chat_id, "Сколько минут выполняли?")
-        bot.register_next_step_handler(msg, lambda m: save_cardio(m, ex_id))
+        bot.send_message(message.chat.id, f"🏃 Упражнение '{name}' добавлено как кардио!",
+                         reply_markup=days_keyboard())
 
-def ask_weight(message, ex_id):
+
+def get_sets(message, day, name):
+    if message.text.lower() in ["❌ отмена", "↩️ назад"]:
+        return get_video(message, day, name, True)
+
     try:
         sets = int(message.text)
-    except:
-        sets = 0
-    msg = bot.send_message(message.chat.id, "Какой вес использовал (кг)?")
-    user_state[message.chat.id]["temp_sets"] = sets
-    bot.register_next_step_handler(msg, lambda m: save_strength(m, ex_id))
+    except ValueError:
+        bot.send_message(message.chat.id, "Введите число.")
+        return bot.register_next_step_handler(message, lambda msg: get_sets(msg, day, name))
 
-def save_strength(message, ex_id):
+    last = data[day][-1]
+    last["подходы"].append(sets)
+    save_data(data)
+
+    bot.send_message(message.chat.id, "⚖️ Сколько кг было на последнем подходе?",
+                     reply_markup=cancel_keyboard())
+    bot.register_next_step_handler(message, lambda msg: get_weight(msg, day, name))
+
+
+def get_weight(message, day, name):
+    if message.text.lower() in ["❌ отмена", "↩️ назад"]:
+        return get_sets(message, day, name)
+
     try:
         weight = float(message.text)
-    except:
-        weight = 0
-    sets = user_state[message.chat.id].pop("temp_sets", 0)
-    save_progress(ex_id, sets=sets, weight=weight)
-    user_state[message.chat.id]["index"] += 1
-    send_next_exercise(message.chat.id)
+    except ValueError:
+        bot.send_message(message.chat.id, "Введите число.")
+        return bot.register_next_step_handler(message, lambda msg: get_weight(msg, day, name))
 
-def save_cardio(message, ex_id):
-    try:
-        duration = int(message.text)
-    except:
-        duration = 0
-    save_progress(ex_id, duration=duration)
-    user_state[message.chat.id]["index"] += 1
-    send_next_exercise(message.chat.id)
+    last = data[day][-1]
+    last["вес"].append(weight)
+    save_data(data)
 
-# --- Добавление упражнения ---
-@bot.message_handler(func=lambda m: m.text=="➕ Добавить упражнение")
-def add_exercise(message):
-    msg = bot.send_message(message.chat.id, "Введите название упражнения:")
-    bot.register_next_step_handler(msg, process_name_step)
+    bot.send_message(message.chat.id, "✅ Записано! Можно добавить новое упражнение.",
+                     reply_markup=days_keyboard())
 
-def process_name_step(message):
-    user_state[message.chat.id] = {"new_exercise": {"name": message.text}}
-    msg = bot.send_message(message.chat.id, "Введите день недели (Понедельник…Воскресенье):")
-    bot.register_next_step_handler(msg, process_day_step)
 
-def process_day_step(message):
-    user_state[message.chat.id]["new_exercise"]["day"] = message.text.lower()
-    msg = bot.send_message(message.chat.id, "Выберите тип упражнения: Силовое или Кардио")
-    bot.register_next_step_handler(msg, process_type_step)
+# ---------- Статистика ----------
+@bot.message_handler(commands=['stats'])
+def stats(message):
+    msg = "📊 Твоя статистика:\n"
+    for day, exs in data.items():
+        msg += f"\n📅 {day.capitalize()}:\n"
+        if not exs:
+            msg += "  — Нет упражнений\n"
+            continue
+        for e in exs:
+            msg += f"  🔸 {e['название']} ({e['тип']})\n"
+            msg += f"     Подходы: {e['подходы']}  Вес: {e['вес']}\n"
+    bot.send_message(message.chat.id, msg)
 
-def process_type_step(message):
-    ex = user_state[message.chat.id]["new_exercise"]
-    text = message.text.lower()
-    if "сил" in text:
-        ex["type"] = "strength"
-    else:
-        ex["type"] = "cardio"
-    msg = bot.send_message(message.chat.id, "Если есть видео, отправьте его как файл, иначе напишите 'нет':")
-    bot.register_next_step_handler(msg, process_video_step)
 
-def process_video_step(message):
-    ex = user_state[message.chat.id]["new_exercise"]
-    if message.content_type == 'document':
-        file_info = bot.get_file(message.document.file_id)
-        downloaded_file = bot.download_file(file_info.file_path)
-        path = os.path.join(VIDEOS_DIR, message.document.file_name)
-        with open(path, 'wb') as f:
-            f.write(downloaded_file)
-        ex["video"] = path
-    else:
-        ex["video"] = None
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO exercises (name, day, type, video) VALUES (?,?,?,?)",
-              (ex["name"], ex["day"], ex["type"], ex["video"]))
-    conn.commit()
-    conn.close()
-    bot.send_message(message.chat.id, f"Упражнение {ex['name']} добавлено! ✅", reply_markup=main_keyboard())
-    user_state.pop(message.chat.id)
+# ---------- Flask сервер для Render ----------
+@app.route('/')
+def home():
+    return "Bot is running"
 
-# --- Удаление упражнения ---
-@bot.message_handler(func=lambda m: m.text=="🗑 Удалить упражнение")
-def delete_exercise(message):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, name, day FROM exercises ORDER BY day")
-    exercises = c.fetchall()
-    conn.close()
-    if not exercises:
-        bot.send_message(message.chat.id, "Список упражнений пустой.", reply_markup=main_keyboard())
-        return
-    markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-    for ex in exercises:
-        markup.add(f"{ex[0]} - {ex[1]} ({ex[2].capitalize()})")
-    msg = bot.send_message(message.chat.id, "Выберите упражнение для удаления:", reply_markup=markup)
-    bot.register_next_step_handler(msg, confirm_delete)
 
-def confirm_delete(message):
-    try:
-        ex_id = int(message.text.split(" - ")[0])
-    except:
-        bot.send_message(message.chat.id, "Ошибка выбора. Попробуй снова.", reply_markup=main_keyboard())
-        return
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM exercises WHERE id=?", (ex_id,))
-    conn.commit()
-    conn.close()
-    bot.send_message(message.chat.id, "Упражнение удалено ✅", reply_markup=main_keyboard())
+def run_flask():
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
-# --- Просмотр расписания ---
-@bot.message_handler(func=lambda m: m.text=="📅 Расписание")
-def show_schedule(message):
-    markup = types.ReplyKeyboardMarkup(one_time_keyboard=True, resize_keyboard=True)
-    for day in ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]:
-        markup.add(day)
-    msg = bot.send_message(message.chat.id, "Выберите день для просмотра упражнений:", reply_markup=markup)
-    bot.register_next_step_handler(msg, show_day_exercises)
 
-def show_day_exercises(message):
-    day = message.text.lower()
-    exercises = get_exercises_for_day(day)
-    if not exercises:
-        bot.send_message(message.chat.id, f"На {message.text} нет упражнений 😔", reply_markup=main_keyboard())
-        return
-    text = f"Упражнения на {message.text}:\n"
-    for ex in exercises:
-        text += f"- {ex[1]} ({'Силовое' if ex[2]=='strength' else 'Кардио'})\n"
-    bot.send_message(message.chat.id, text, reply_markup=main_keyboard())
+# ---------- Запуск ----------
+def run_bot():
+    bot.polling(none_stop=True, interval=0, timeout=20)
 
-# --- Прогресс и графики ---
-@bot.message_handler(func=lambda m: m.text=="📈 Прогресс")
-def progress(message):
-    send_progress_graph(message.chat.id)
 
-def send_progress_graph(chat_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT date, weight FROM progress WHERE weight IS NOT NULL ORDER BY date")
-    data = c.fetchall()
-    conn.close()
-    if not data:
-        bot.send_message(chat_id, "Нет данных для графиков.", reply_markup=main_keyboard())
-        return
-    dates = [d[0] for d in data]
-    weights = [d[1] for d in data]
-    plt.figure()
-    plt.plot(dates, weights, marker='o')
-    plt.title("Динамика веса")
-    plt.xlabel("Дата")
-    plt.ylabel("Вес (кг)")
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plot_file = "weight_plot.png"
-    plt.savefig(plot_file)
-    plt.close()
-    bot.send_photo(chat_id, open(plot_file, 'rb'))
-
-# --- Запуск бота ---
-print("Бот запущен...")
-bot.polling(none_stop=True)
+if __name__ == "__main__":
+    Thread(target=run_flask).start()
+    Thread(target=run_bot).start()
